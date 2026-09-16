@@ -20292,3 +20292,125 @@ class TestSpark2_5Model(unittest.TestCase):
         weights = {"model.embedding.weight": mx.zeros((128, 64))}
         sanitized = model.sanitize(weights)
         self.assertIn("language_model.model.embedding.weight", sanitized)
+
+
+class TestGVM(unittest.TestCase):
+    # Generative Video Matting: SVD-XT spatio-temporal UNet + temporal VAE.
+
+    def _tiny_unet_config(self, **overrides):
+        from mlx_vlm.models.gvm.config import UNetConfig
+
+        args = dict(
+            in_channels=8,
+            out_channels=4,
+            down_block_types=(
+                "CrossAttnDownBlockSpatioTemporal",
+                "DownBlockSpatioTemporal",
+            ),
+            up_block_types=(
+                "UpBlockSpatioTemporal",
+                "CrossAttnUpBlockSpatioTemporal",
+            ),
+            block_out_channels=(32, 64),
+            layers_per_block=2,
+            cross_attention_dim=16,
+            num_attention_heads=(2, 4),
+            num_frames=4,
+        )
+        args.update(overrides)
+        return UNetConfig(**args)
+
+    def test_unet_forward_shape(self):
+        from mlx_vlm.models.gvm.unet import GVMUNet
+
+        config = self._tiny_unet_config()
+        unet = GVMUNet(config)
+
+        batch, frames, height, width = 2, 3, 16, 24
+        sample = mx.random.normal((batch, frames, height, width, config.in_channels))
+        encoder_hidden_states = mx.random.normal((batch, 1, config.cross_attention_dim))
+        out = unet(sample, mx.array(999), encoder_hidden_states)
+        mx.eval(out)
+        self.assertEqual(out.shape, (batch, frames, height, width, config.out_channels))
+
+    def test_unet_temporal_conv_is_frame_local(self):
+        """Zero-init temporal mixer keeps spatial path; frames stay independent."""
+        from mlx_vlm.models.gvm.layers import SpatioTemporalResBlock
+
+        block = SpatioTemporalResBlock(32, 32, temb_channels=None, eps=1e-6)
+        block.time_mixer.mix_factor = mx.array([20.0])  # sigmoid ~ 1: spatial only
+        batch, frames, height, width = 2, 3, 8, 8
+        x = mx.random.normal((batch * frames, height, width, 32))
+        ioi = mx.zeros((batch, frames))
+        out = block(x, None, ioi)
+        mx.eval(out)
+        self.assertEqual(out.shape, x.shape)
+        # with alpha ~ 0 the output equals the spatial resnet path
+        ref = block.spatial_res_block(x, None)
+        self.assertLess(float(mx.abs(out - ref).max()), 1e-4)
+
+    def test_vae_roundtrip_shapes(self):
+        from mlx_vlm.models.gvm.config import VAEConfig
+        from mlx_vlm.models.gvm.vae import GVMVAE
+
+        config = VAEConfig(
+            down_block_types=("DownEncoderBlock2D",) * 2,
+            block_out_channels=(32, 64),
+            layers_per_block=2,
+            latent_channels=4,
+        )
+        vae = GVMVAE(config)
+        frames, height, width = 2, 24, 32
+        x = mx.random.normal((frames, height, width, 3))
+        latent = vae.encode(x)
+        mx.eval(latent)
+        # 2 down blocks, downsampling in all but the last -> stride 2
+        self.assertEqual(latent.shape, (frames, height // 2, width // 2, 4))
+        decoded = vae.decode(latent, num_frames=frames)
+        mx.eval(decoded)
+        self.assertEqual(decoded.shape, (frames, height, width, 3))
+
+    def test_scheduler_shift_and_step(self):
+        import numpy as np
+
+        from mlx_vlm.models.gvm.config import SchedulerConfig
+        from mlx_vlm.models.gvm.scheduler import FlowMatchEulerDiscreteScheduler
+
+        scheduler = FlowMatchEulerDiscreteScheduler(
+            SchedulerConfig(num_train_timesteps=1000, shift=3.0)
+        )
+        scheduler.set_timesteps(1)
+        # single step: shifted sigma schedule starts at timestep 1000
+        np.testing.assert_allclose(np.array(scheduler.timesteps), [1000.0], atol=1e-3)
+        sample = mx.zeros((1, 4))
+        model_output = mx.ones((1, 4))
+        prev = scheduler.step(model_output, scheduler.timesteps[0], sample)
+        # dt = sigma_next - sigma = 0 - 1 = -1
+        np.testing.assert_allclose(np.array(prev), -np.ones((1, 4)), atol=1e-5)
+
+    def test_sanitize_transposes_conv_weights(self):
+        from mlx_vlm.models.gvm.weights import sanitize_weights
+
+        weights = {
+            "conv.weight": mx.zeros((8, 4, 3, 3)),  # torch OIHW
+            "conv3d.weight": mx.zeros((8, 4, 3, 1, 1)),  # torch OIDHW
+            "linear.weight": mx.zeros((8, 4)),
+            "norm.bias": mx.zeros((8,)),
+        }
+        out = sanitize_weights(weights)
+        self.assertEqual(out["conv.weight"].shape, (8, 3, 3, 4))  # MLX OHWI
+        self.assertEqual(out["conv3d.weight"].shape, (8, 3, 1, 1, 4))  # MLX ODHWI
+        self.assertEqual(out["linear.weight"].shape, (8, 4))
+        # already-converted checkpoints pass through untouched
+        passthrough = sanitize_weights(weights, source_layout=False)
+        self.assertEqual(passthrough["conv.weight"].shape, (8, 4, 3, 3))
+
+    def test_config_from_dict_backward_compatible(self):
+        from mlx_vlm.models.gvm.config import ModelConfig
+
+        config = ModelConfig.from_dict({})
+        self.assertEqual(config.model_type, "gvm")
+        self.assertIsNone(config.lora)
+        self.assertEqual(config.unet.in_channels, 8)
+        self.assertEqual(config.vae.latent_channels, 4)
+        self.assertEqual(config.scheduler.num_train_timesteps, 1000)
