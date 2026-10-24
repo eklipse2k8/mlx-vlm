@@ -2978,3 +2978,1852 @@ class TestPhiMoE:
         )
 
         assert isinstance(Attention(config).rope, nn.RoPE)
+
+
+class TestKimodoBackbone:
+    @staticmethod
+    def config(**overrides):
+        from mlx_vlm.models.kimodo.config import ModelConfig
+
+        values = dict(
+            latent_dim=16,
+            ff_size=32,
+            num_layers=2,
+            num_heads=4,
+            llm_shape=(1, 8),
+            num_text_tokens_override=3,
+            max_position_embeddings=64,
+            num_base_steps=32,
+        )
+        return ModelConfig(**dict(values, **overrides))
+
+    def test_nested_checkpoint_config(self):
+        from mlx_vlm.models.kimodo.config import ModelConfig
+
+        config = ModelConfig.from_dict(
+            {
+                "_target_": "kimodo.model.Kimodo",
+                "num_base_steps": 1000,
+                "denoiser": {
+                    "_target_": "kimodo.model.twostage_denoiser.TwostageDenoiser",
+                    "latent_dim": 128,
+                    "ckpt_path": "${checkpoint_dir}/model.safetensors",
+                    "motion_rep": {
+                        "_target_": "kimodo.motion_rep.ArdyMotionRep",
+                        "fps": 60,
+                        "skeleton": {"_target_": "kimodo.skeleton.G1Skeleton34"},
+                    },
+                },
+            }
+        )
+        assert config.motion_rep == "ArdyMotionRep"
+        assert config.skeleton == "G1Skeleton34"
+        assert config.fps == 60
+        assert config.latent_dim == 128
+        assert ModelConfig.from_dict(config.to_dict()) == config
+        assert ModelConfig.from_dict(None) == ModelConfig()
+        with pytest.raises(ValueError, match="divisible"):
+            self.config(latent_dim=18)
+
+    def test_feature_and_mask_padding(self):
+        from mlx_vlm.models.kimodo.backbone import pad_x_and_mask_to_fixed_size
+
+        x = mx.arange(12, dtype=mx.float32).reshape(1, 4, 3)
+        mask = mx.array([[True, True, True, False]])
+        cropped, cropped_mask = pad_x_and_mask_to_fixed_size(x, mask, 2)
+        assert mx.array_equal(cropped, x[:, :2])
+        assert mx.array_equal(cropped_mask, mask[:, :2])
+        padded, padded_mask = pad_x_and_mask_to_fixed_size(x, mask, 6)
+        assert padded.shape == (1, 6, 3)
+        assert mx.array_equal(padded[:, :4], x)
+        assert mx.all(padded[:, 4:] == 0)
+        assert mx.array_equal(padded_mask[:, :4], mask)
+        assert not mx.any(padded_mask[:, 4:])
+
+    @pytest.mark.parametrize("norm_first", [False, True])
+    @pytest.mark.parametrize("activation", ["gelu", "relu"])
+    @pytest.mark.parametrize("use_text_mask", [False, True])
+    def test_reference_transformer(self, norm_first, activation, use_text_mask):
+        torch = pytest.importorskip("torch")
+        from mlx_vlm.models.kimodo.backbone import TransformerEncoderBlock
+
+        config = self.config(
+            norm_first=norm_first,
+            activation=activation,
+            use_text_mask=use_text_mask,
+        )
+
+        class Reference(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed_text = torch.nn.Linear(8, 16)
+                self.embed_timestep = torch.nn.Module()
+                self.embed_timestep.time_embed = torch.nn.Sequential(
+                    torch.nn.Linear(16, 16),
+                    torch.nn.SiLU(),
+                    torch.nn.Linear(16, 16),
+                )
+                self.input_linear = torch.nn.Linear(10, 16)
+                self.output_linear = torch.nn.Linear(16, 5)
+                self.linear_first_heading_angle = torch.nn.Linear(2, 16)
+                self.seqTransEncoder = torch.nn.TransformerEncoder(
+                    torch.nn.TransformerEncoderLayer(
+                        16,
+                        4,
+                        dim_feedforward=32,
+                        dropout=0,
+                        activation=activation,
+                        batch_first=True,
+                        norm_first=norm_first,
+                    ),
+                    2,
+                    enable_nested_tensor=False,
+                )
+                phase = torch.arange(64)[:, None] * torch.pow(
+                    10000.0, -torch.arange(0, 16, 2).float() / 16
+                )
+                self.register_buffer(
+                    "pe",
+                    torch.stack((phase.sin(), phase.cos()), dim=-1).reshape(1, 64, 16),
+                    persistent=False,
+                )
+
+            def forward(self, x, x_mask, text, text_mask, times, heading):
+                text = torch.nn.functional.pad(text, (0, 0, 0, 3 - text.shape[1]))
+                text_mask = torch.nn.functional.pad(
+                    text_mask, (0, 3 - text_mask.shape[1]), value=False
+                )
+                if not use_text_mask:
+                    text_mask = torch.ones_like(text_mask)
+                heading = torch.stack((heading.cos(), heading.sin()), dim=-1)
+                prefix = torch.cat(
+                    (
+                        self.embed_text(text),
+                        self.embed_timestep.time_embed(self.pe[0, times])[:, None],
+                        self.linear_first_heading_angle(heading)[:, None],
+                    ),
+                    dim=1,
+                )
+                valid = torch.cat(
+                    (text_mask, torch.ones((x.shape[0], 2), dtype=torch.bool), x_mask),
+                    dim=1,
+                )
+                sequence = torch.cat((prefix, self.input_linear(x)), dim=1)
+                sequence = sequence + self.pe[:, : sequence.shape[1]]
+                encoded = self.seqTransEncoder(sequence, src_key_padding_mask=~valid)
+                return self.output_linear(encoded[:, prefix.shape[1] :])
+
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(12)
+            reference = Reference().eval()
+        model = TransformerEncoderBlock(config, 10, 5)
+        model.eval()
+        model.load_weights(
+            [
+                (name, mx.array(weight.detach().numpy()))
+                for name, weight in reference.state_dict().items()
+            ],
+            strict=True,
+        )
+        rng = np.random.default_rng(12)
+        for text_length in (2, 3):
+            args = (
+                torch.from_numpy(rng.normal(size=(2, 6, 10)).astype(np.float32)),
+                torch.tensor([[True] * 6, [True] * 4 + [False] * 2]),
+                torch.from_numpy(
+                    rng.normal(size=(2, text_length, 8)).astype(np.float32)
+                ),
+                torch.tensor(
+                    [[True] * text_length, [True] * (text_length - 1) + [False]]
+                ),
+                torch.tensor([8, 3]),
+                torch.tensor([0.2, -0.4]),
+            )
+            with torch.no_grad():
+                expected = reference(*args).numpy()
+            with patch.object(
+                mx, "eval", side_effect=AssertionError("Eager evaluation")
+            ):
+                actual = model(*(mx.array(value.numpy()) for value in args))
+            np.testing.assert_allclose(np.array(actual), expected, rtol=2e-5, atol=1e-6)
+
+    def test_heading_requirement(self):
+        from mlx_vlm.models.kimodo.backbone import TransformerEncoderBlock
+
+        model = TransformerEncoderBlock(self.config(), 10, 5)
+        with pytest.raises(ValueError, match="heading"):
+            model(
+                mx.zeros((1, 2, 10)),
+                mx.ones((1, 2), mx.bool_),
+                mx.zeros((1, 1, 8)),
+                mx.ones((1, 1), mx.bool_),
+                mx.array([0]),
+            )
+
+    def test_conversion_failure_is_retryable(self, tmp_path):
+        import sys
+        import types
+
+        pytest.importorskip("omegaconf")
+        from mlx_vlm.models.kimodo.convert import convert
+        from mlx_vlm.models.kimodo.language import LLM2VecEncoder
+
+        source = tmp_path / "source"
+        (source / "kimodo" / "skeleton").mkdir(parents=True)
+        (source / "config.yaml").write_text("model_type: kimodo\n")
+        mx.save_safetensors(str(source / "model.safetensors"), {"weight": mx.ones(1)})
+        output = tmp_path / "converted"
+        tensor = SimpleNamespace(numpy=lambda: np.ones(1, dtype=np.float32))
+        stats = SimpleNamespace(mean=tensor, std=tensor)
+        motion_rep = SimpleNamespace(
+            global_root_stats=stats, local_root_stats=stats, body_stats=stats
+        )
+        source_package = types.ModuleType("kimodo")
+        source_package.skeleton = SimpleNamespace(SOMASkeleton30=lambda: object())
+        source_reps = types.ModuleType("kimodo.motion_rep")
+        source_reps.KimodoMotionRep = source_reps.ArdyMotionRep = (
+            lambda *args, **kwargs: motion_rep
+        )
+        fake_model = MagicMock()
+        fake_model.sanitize.side_effect = lambda weights: weights
+
+        def save(path, model):
+            (path / "model.safetensors").write_bytes(b"test checkpoint")
+
+        with (
+            patch.dict(
+                sys.modules,
+                {"kimodo": source_package, "kimodo.motion_rep": source_reps},
+            ),
+            patch(
+                "mlx_vlm.models.kimodo.convert.get_model_path", return_value=source
+            ) as resolve,
+            patch("mlx_vlm.models.kimodo.convert.skeleton_metadata", return_value={}),
+            patch("mlx_vlm.models.kimodo.convert.Model", return_value=fake_model),
+            patch("mlx_vlm.models.kimodo.convert.save_weights", side_effect=save),
+        ):
+            with patch.object(
+                LLM2VecEncoder,
+                "from_pretrained",
+                side_effect=RuntimeError("adapter failure"),
+            ):
+                with pytest.raises(RuntimeError, match="adapter failure"):
+                    convert(
+                        "source", output, kimodo_source=source, text_encoder="missing"
+                    )
+            assert not output.exists()
+            assert not list(tmp_path.glob(".converted-*"))
+            resolve.assert_called_with(
+                "source", allow_patterns=["*.safetensors", "*.yaml", "*.npy", "*.json"]
+            )
+            assert convert("source", output, kimodo_source=source) == output
+            assert (output / "config.json").is_file()
+            assert (output / "model.safetensors").read_bytes() == b"test checkpoint"
+            with pytest.raises(FileExistsError, match="not empty"):
+                convert("source", output, kimodo_source=source)
+            assert (output / "model.safetensors").read_bytes() == b"test checkpoint"
+
+
+class TestKimodoTextEncoder:
+    @staticmethod
+    def config():
+        return dict(
+            model_type="llama",
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=32,
+            max_position_embeddings=512,
+            rope_theta=500000.0,
+        )
+
+    @staticmethod
+    def tokenizer():
+        from tokenizers import Tokenizer, models, pre_tokenizers, processors
+        from transformers import PreTrainedTokenizerFast
+
+        vocab = {
+            "<unk>": 0,
+            "<bos>": 1,
+            "<eos>": 2,
+            "<|start_header_id|>": 3,
+            "<|end_header_id|>": 4,
+            "<|eot_id|>": 5,
+            "user": 6,
+            "walk": 7,
+            "forward": 8,
+            "wave": 9,
+        }
+        backend = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
+        backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+        backend.post_processor = processors.TemplateProcessing(
+            single="<bos> $A", special_tokens=[("<bos>", 1)]
+        )
+        return PreTrainedTokenizerFast(
+            tokenizer_object=backend,
+            unk_token="<unk>",
+            bos_token="<bos>",
+            eos_token="<eos>",
+            additional_special_tokens=[
+                "<|start_header_id|>",
+                "<|end_header_id|>",
+                "<|eot_id|>",
+            ],
+        )
+
+    def test_source_prompt_format_and_document_pooling(self):
+        from mlx_vlm.models.kimodo.language import LLM2VecEncoder
+
+        encoder = LLM2VecEncoder(self.config(), self.tokenizer())
+        prompt = encoder.prepare_for_tokenization(
+            encoder._convert_to_str("", "walk forward")
+        )
+        assert prompt == (
+            "<|start_header_id|>user<|end_header_id|>\n\n"
+            "!@#$%^&*()walk forward<|eot_id|>"
+        )
+        features = encoder.tokenize([prompt])
+        np.testing.assert_array_equal(
+            np.array(features["input_ids"]), [[1, 3, 6, 4, 7, 8, 5]]
+        )
+        np.testing.assert_array_equal(
+            np.array(features["embed_mask"]), [[0, 0, 0, 0, 1, 1, 1]]
+        )
+        encoder.doc_max_length = 2
+        assert encoder._convert_to_str("  move  ", "walk forward wave") == (
+            "move !@#$%^&*()walk forward"
+        )
+        with patch.object(mx, "eval", side_effect=AssertionError("Eager evaluation")):
+            batch, lengths = encoder(["walk forward", "wave"])
+            single, length = encoder("walk forward")
+        assert batch.shape == (2, 1, 16) and lengths == [1, 1]
+        assert single.shape == (1, 16) and length == 1
+        np.testing.assert_array_equal(np.array(single), np.array(batch[0]))
+
+    def test_bidirectional_torch_parity(self):
+        torch = pytest.importorskip("torch")
+        from transformers import LlamaConfig, LlamaModel
+
+        from mlx_vlm.models.kimodo.language import LLM2VecEncoder
+
+        config = self.config()
+        torch_config = LlamaConfig(**config)
+        torch_config._attn_implementation = "eager"
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(14)
+            reference = LlamaModel(torch_config).eval()
+        encoder = LLM2VecEncoder(torch_config.to_dict())
+        encoder.load_weights(
+            list(
+                encoder.sanitize(
+                    {
+                        name: mx.array(value.detach().numpy())
+                        for name, value in reference.state_dict().items()
+                    }
+                ).items()
+            ),
+            strict=True,
+        )
+        ids = torch.tensor([[1, 7, 8, 9], [2, 1, 7, 8]])
+        mask = torch.tensor([[1, 1, 1, 1], [0, 1, 1, 1]])
+        embed_mask = torch.tensor([[0, 0, 1, 1], [0, 0, 0, 1]])
+        bidirectional_mask = torch.where(
+            mask[:, None, None, :].bool(), 0.0, -torch.inf
+        ).expand(-1, 1, ids.shape[-1], -1)
+        with torch.no_grad():
+            hidden = reference(ids, attention_mask=bidirectional_mask).last_hidden_state
+            expected = torch.stack((hidden[0, -2:].mean(0), hidden[1, -1])).numpy()
+        actual = encoder.encode_tokens(
+            mx.array(ids.numpy()), mx.array(mask.numpy()), mx.array(embed_mask.numpy())
+        )
+        np.testing.assert_allclose(np.array(actual), expected, atol=1e-6, rtol=2e-5)
+
+    def test_both_adapters_and_converted_roundtrip(self, tmp_path):
+        from mlx_vlm.models.kimodo.language import LLM2VecEncoder
+
+        config = self.config()
+        config["_name_or_path"] = "meta-llama/Meta-Llama-3-8B-Instruct"
+        base, mntp, supervised = (
+            tmp_path / name for name in ("base", "mntp", "supervised")
+        )
+        for path in (base, mntp, supervised):
+            path.mkdir()
+        tokenizer = self.tokenizer()
+        initial = LLM2VecEncoder(config, tokenizer)
+        weights = dict(tree_flatten(initial.parameters()))
+        mx.save_safetensors(str(base / "model.safetensors"), weights)
+        (base / "config.json").write_text(json.dumps(config))
+        (mntp / "config.json").write_text(json.dumps(config))
+        tokenizer.save_pretrained(mntp)
+        target = "model.layers.0.self_attn.q_proj.weight"
+        expected = weights[target]
+        for scale, path in ((1, mntp), (2, supervised)):
+            adapter_config = dict(
+                peft_type="LORA", r=2, lora_alpha=4, base_model_name_or_path=str(base)
+            )
+            (path / "adapter_config.json").write_text(json.dumps(adapter_config))
+            prefix = "base_model.model.layers.0.self_attn.q_proj"
+            adapter = {
+                prefix + ".lora_A.weight": mx.full((2, 16), 0.01 * scale),
+                prefix + ".lora_B.weight": mx.full((16, 2), 0.02 * scale),
+            }
+            mx.save_safetensors(str(path / "adapter_model.safetensors"), adapter)
+            expected = expected + 2 * (
+                adapter[prefix + ".lora_B.weight"] @ adapter[prefix + ".lora_A.weight"]
+            )
+        encoder = LLM2VecEncoder.from_pretrained(
+            str(mntp), str(supervised), dtype="float32"
+        )
+        actual_weights = dict(tree_flatten(encoder.parameters()))
+        np.testing.assert_allclose(np.array(actual_weights[target]), np.array(expected))
+        before, _ = encoder(["walk forward", "wave"])
+        converted = tmp_path / "converted"
+        encoder.save_pretrained(converted)
+        reloaded = LLM2VecEncoder.from_pretrained(str(converted))
+        after, _ = reloaded(["walk forward", "wave"])
+        np.testing.assert_array_equal(np.array(before), np.array(after))
+
+
+class TestKimodoPipeline:
+    def model(self):
+        from mlx_vlm.models.kimodo import Model, ModelConfig
+        from mlx_vlm.models.kimodo.motion import KimodoMotionRep, Skeleton
+
+        skeleton = Skeleton(
+            neutral_joints=[[0, 0, 0], [-0.2, 0, 0], [0.2, 0, 0]],
+            joint_parents=[-1, 0, 0],
+            hip_joint_idx=[2, 1],
+        )
+        config = ModelConfig(
+            latent_dim=16,
+            ff_size=24,
+            num_layers=1,
+            num_heads=4,
+            llm_shape=(1, 16),
+            num_text_tokens_override=3,
+            num_base_steps=16,
+            max_position_embeddings=64,
+        )
+        model = Model(config, KimodoMotionRep(skeleton))
+        model.eval()
+        return model
+
+    def test_ddim_reference(self):
+        from mlx_vlm.models.kimodo.diffusion import Diffusion
+
+        torch = pytest.importorskip("torch")
+        schedule = Diffusion(1000)
+
+        def alpha(t):
+            return math.cos((t + 0.008) / 1.008 * math.pi / 2) ** 2
+
+        betas = torch.tensor(
+            [
+                min(1 - alpha((i + 1) / 1000) / alpha(i / 1000), 0.999)
+                for i in range(1000)
+            ],
+            dtype=torch.float32,
+        )
+        base = torch.cumprod(1 - betas, 0)
+        for steps in (1, 4, 15, 17, 1000):
+            indices, actual, previous = schedule.schedule(steps)
+            expected_indices = torch.round(
+                torch.arange(1000) * (999 / max(1, steps - 1))
+            ).long()[:steps]
+            np.testing.assert_array_equal(np.array(indices), expected_indices.numpy())
+            selected = base[expected_indices]
+            prior = torch.cat([torch.ones(1), selected[:-1]])
+            expected = torch.cumprod(1 - (1 - selected / prior), 0).clamp(min=1e-9)
+            expected_prior = torch.cat([torch.ones(1), expected[:-1]])
+            noisy = torch.linspace(-2, 2, 12).reshape(1, 3, 4)
+            clean = noisy * 0.2
+            for index in (0, steps - 1):
+                eps = (torch.rsqrt(expected[index]) * noisy - clean) / torch.sqrt(
+                    1 / expected[index] - 1
+                )
+                out = (
+                    torch.sqrt(expected_prior[index]) * clean
+                    + torch.sqrt(1 - expected_prior[index]) * eps
+                )
+                result = schedule.step(
+                    mx.array(noisy.numpy()),
+                    mx.array(clean.numpy()),
+                    actual[index],
+                    previous[index],
+                )
+                np.testing.assert_allclose(
+                    np.array(result), out.numpy(), rtol=2e-5, atol=2e-6
+                )
+        with pytest.raises(ValueError):
+            schedule.schedule(1001)
+
+    @pytest.mark.parametrize(
+        "strategy,weight", [("nocfg", 1), ("regular", 1.7), ("separated", (2, 0.5))]
+    )
+    def test_batched_guidance_matches_independent_branches(self, strategy, weight):
+        from mlx_vlm.models.kimodo.diffusion import guided_prediction
+
+        model = self.model()
+        dim = model.motion_rep.motion_rep_dim
+        x = mx.random.normal((2, 4, dim))
+        pad = mx.array([[True] * 4, [True, True, False, False]])
+        text = mx.random.normal((2, 1, 16))
+        text_mask = mx.ones((2, 1), mx.bool_)
+        time = mx.array([3, 9])
+        heading = mx.array([0.2, -0.4])
+        mask = (mx.arange(dim) % 3 == 0).astype(mx.float32)[None, None] * mx.ones(
+            x.shape
+        )
+        observed = mx.random.normal(x.shape)
+
+        def run(features, valid, observed_mask):
+            return model(
+                x,
+                pad,
+                features,
+                valid,
+                time,
+                first_heading_angle=heading,
+                motion_mask=observed_mask,
+                observed_motion=observed,
+            )
+
+        actual = guided_prediction(
+            model,
+            x,
+            pad,
+            text,
+            text_mask,
+            time,
+            first_heading_angle=heading,
+            motion_mask=mask,
+            observed_motion=observed,
+            cfg_type=strategy,
+            cfg_weight=weight,
+        )
+        unconditional = run(
+            mx.zeros_like(text), mx.zeros_like(text_mask), mx.zeros_like(mask)
+        )
+        if strategy == "nocfg":
+            expected = run(text, text_mask, mask)
+        elif strategy == "regular":
+            expected = unconditional + weight * (
+                run(text, text_mask, mask) - unconditional
+            )
+        else:
+            expected = (
+                unconditional
+                + weight[0]
+                * (run(text, text_mask, mx.zeros_like(mask)) - unconditional)
+                + weight[1]
+                * (
+                    run(mx.zeros_like(text), mx.zeros_like(text_mask), mask)
+                    - unconditional
+                )
+            )
+        assert mx.allclose(actual, expected, atol=2e-6, rtol=2e-5)
+
+    @pytest.mark.parametrize("training", [False, True])
+    def test_unconstrained_guidance_reuses_the_unconditional_branch(self, training):
+        from mlx_vlm.models.kimodo.diffusion import guided_prediction
+
+        model = self.model()
+        model.train(training)
+        x = mx.random.normal((2, 5, model.motion_rep.motion_rep_dim))
+        pad = mx.array([[True] * 5, [True] * 3 + [False] * 2])
+        text = mx.random.normal((2, 1, 16))
+        mask = mx.ones((2, 1), mx.bool_)
+        time = mx.array([3, 9])
+        heading = mx.array([0.2, -0.4])
+        conditional = model(x, pad, text, mask, time, first_heading_angle=heading)
+        unconditional = model(
+            x,
+            pad,
+            mx.zeros_like(text),
+            mx.zeros_like(mask),
+            time,
+            first_heading_angle=heading,
+        )
+        recorder = MagicMock(wraps=model)
+        recorder.training = training
+        result = guided_prediction(
+            recorder,
+            x,
+            pad,
+            text,
+            mask,
+            time,
+            first_heading_angle=heading,
+            cfg_weight=(1.7, 9.0),
+        )
+        assert recorder.call_args.args[0].shape[0] == (6 if training else 4)
+        assert mx.allclose(
+            result,
+            unconditional + 1.7 * (conditional - unconditional),
+            atol=2e-6,
+            rtol=2e-5,
+        )
+
+    @pytest.mark.parametrize("constrained", [False, True])
+    @pytest.mark.parametrize(
+        "strategy, weight", [("nocfg", 1), ("regular", 1.7), ("separated", (2, 0.5))]
+    )
+    def test_compiled_sampling_matches_eager_and_tracks_weights(
+        self, constrained, strategy, weight
+    ):
+        from mlx_vlm.models.kimodo import KimodoPipeline
+
+        model = self.model()
+        pipeline = KimodoPipeline(model)
+        shape = (2, 5, model.motion_rep.motion_rep_dim)
+        text = mx.random.normal((2, 1, 16))
+        text_mask = mx.ones((2, 1), mx.bool_)
+        kwargs = dict(
+            initial_noise=mx.random.normal(shape), cfg_type=strategy, cfg_weight=weight
+        )
+        if constrained:
+            kwargs.update(
+                motion_mask=mx.ones(shape), observed_motion=mx.random.normal(shape)
+            )
+        eager = pipeline.sample(text, text_mask, [5, 3], 3, **kwargs)
+        with (
+            patch.object(mx, "eval", side_effect=AssertionError("eager evaluation")),
+            patch.object(mx, "synchronize", side_effect=AssertionError("synchronize")),
+        ):
+            compiled = pipeline.sample(
+                text, text_mask, [5, 3], 3, compile=True, **kwargs
+            )
+        assert mx.allclose(compiled, eager, atol=3e-5, rtol=3e-5)
+        model.denoiser.root_model.output_linear.bias += 0.1
+        updated = pipeline.sample(text, text_mask, [5, 3], 3, compile=True, **kwargs)
+        expected = pipeline.sample(text, text_mask, [5, 3], 3, **kwargs)
+        assert mx.allclose(updated, expected, atol=3e-5, rtol=3e-5)
+        assert not mx.allclose(updated, compiled, atol=1e-5)
+        model.train()
+        with pytest.raises(ValueError, match="model.eval"):
+            pipeline.sample(text, text_mask, [5, 3], 3, compile=True, **kwargs)
+
+    def test_lazy_native_text_to_skeleton_and_seed(self):
+        from mlx_vlm.models.kimodo.language import LLM2VecEncoder
+        from mlx_vlm.models.kimodo.pipeline import KimodoPipeline
+
+        class Tokenizer:
+            eos_token = "eos"
+            bos_token_id = 1
+
+            def __call__(self, texts, **kwargs):
+                single = isinstance(texts, str)
+                texts = [texts] if single else texts
+                rows = [[1] + [2 + ord(c) % 28 for c in text[:12]] for text in texts]
+                width = max(map(len, rows))
+                ids = [[0] * (width - len(row)) + row for row in rows]
+                mask = [[0] * (width - len(row)) + [1] * len(row) for row in rows]
+                return {
+                    "input_ids": ids[0] if single else ids,
+                    "attention_mask": mask[0] if single else mask,
+                }
+
+        model = self.model()
+        encoder = LLM2VecEncoder(
+            dict(
+                model_type="llama",
+                hidden_size=16,
+                intermediate_size=32,
+                num_hidden_layers=1,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                vocab_size=32,
+                rms_norm_eps=1e-5,
+            ),
+            tokenizer=Tokenizer(),
+        )
+        encoder.eval()
+        pipeline = KimodoPipeline(model, encoder)
+        with (
+            patch.object(mx, "eval", side_effect=AssertionError("eager evaluation")),
+            patch.object(
+                mx, "synchronize", side_effect=AssertionError("GPU synchronization")
+            ),
+            patch.object(np, "array", side_effect=AssertionError("host transfer")),
+        ):
+            result = pipeline.generate("a person walks", 5, 4, seed=19)
+        assert result["posed_joints"].shape == (5, 3, 3)
+        assert result["global_rot_mats"].shape == (5, 3, 3, 3)
+        assert all(isinstance(value, mx.array) for value in result.values())
+        assert mx.all(mx.isfinite(result["posed_joints"]))
+        same = pipeline.generate("a person walks", 5, 4, seed=19)
+        assert mx.array_equal(result["posed_joints"], same["posed_joints"])
+        different = pipeline.generate("a person walks", 5, 4, seed=20)
+        assert not mx.array_equal(result["posed_joints"], different["posed_joints"])
+
+    def test_shared_checkpoint_loader(self, tmp_path):
+        from mlx_vlm.models.kimodo import ModelConfig
+        from mlx_vlm.utils import load, save_weights
+
+        model = self.model()
+        assets = tmp_path / "assets"
+        assets.mkdir()
+        skeleton = dict(
+            neutral_joints=[[0, 0, 0], [-0.2, 0, 0], [0.2, 0, 0]],
+            joint_parents=[-1, 0, 0],
+            hip_joint_idx=[2, 1],
+        )
+        (assets / "skeleton.json").write_text(json.dumps(skeleton))
+        rep = model.motion_rep
+        mx.save_safetensors(
+            str(assets / "motion_stats.safetensors"),
+            {
+                name + "." + stat: getattr(getattr(rep, name + "_stats"), stat)
+                for name in ("global_root", "local_root", "body")
+                for stat in ("mean", "std")
+            },
+        )
+        (tmp_path / "config.json").write_text(json.dumps(model.config.to_dict()))
+        save_weights(tmp_path, model)
+        loaded, processor = load(str(tmp_path), lazy=True)
+        assert isinstance(loaded.config, ModelConfig)
+        assert processor("walk")["prompts"] == "walk"
+        assert set(dict(tree_flatten(loaded.parameters()))) == set(
+            dict(tree_flatten(model.parameters()))
+        )
+        assert all(
+            mx.array_equal(value, dict(tree_flatten(loaded.parameters()))[name])
+            for name, value in tree_flatten(model.parameters())
+        )
+
+
+class TestKimodoCLI:
+    @pytest.mark.parametrize(
+        "prompts, flags, batch",
+        [
+            (["Walk"], [], 1),
+            (["Walk", "Wave"], [], 2),
+            (["Walk"], ["--num-samples", "3"], 3),
+            (["Walk", "Wave"], ["--num-samples", "2"], 2),
+            (["Walk", "Wave"], ["--multi-prompt"], 1),
+            (["Walk", "Wave"], ["--multi-prompt", "--num-samples", "2"], 2),
+            (["Walk"], ["--compile"], 1),
+            (["Walk", "Wave"], ["--multi-prompt", "--compile"], 1),
+        ],
+    )
+    def test_sample_count_inference(self, prompts, flags, batch, tmp_path):
+        cli = importlib.import_module("mlx_vlm.models.kimodo.generate")
+        pipeline = TestKimodoMultiPrompt.pipeline()
+        output = tmp_path / "motion.npz"
+
+        def sample(text_features, text_mask, lengths, steps, **kwargs):
+            rep = pipeline.motion_rep
+            local = mx.broadcast_to(
+                mx.eye(3), (len(lengths), max(lengths), rep.skeleton.nbjoints, 3, 3)
+            )
+            roots = mx.zeros((len(lengths), max(lengths), 3))
+            return rep(local, roots, lengths=mx.array(lengths))
+
+        with (
+            patch(
+                "sys.argv",
+                [
+                    "kimodo.generate",
+                    "--model",
+                    "unused",
+                    "--prompt",
+                    *prompts,
+                    "--duration",
+                    "0.2",
+                    "--output",
+                    str(output),
+                    *flags,
+                ],
+            ),
+            patch.object(cli, "load", return_value=pipeline.model),
+            patch.object(cli, "KimodoPipeline", return_value=pipeline),
+            patch.object(pipeline, "sample", side_effect=sample) as sampling,
+        ):
+            cli.main()
+        assert all(
+            call.kwargs["compile"] == ("--compile" in flags)
+            for call in sampling.call_args_list
+        )
+        with np.load(output) as saved:
+            frames = round(0.2 * pipeline.model.config.fps)
+            if "--multi-prompt" in flags:
+                frames *= len(prompts)
+            assert saved["posed_joints"].shape == (batch, frames, 7, 3)
+
+
+class TestKimodoMotion:
+    @staticmethod
+    def skeleton():
+        from mlx_vlm.models.kimodo.motion import Skeleton
+
+        return Skeleton(
+            neutral_joints=[
+                [0, 0, 0],
+                [-0.2, 0, 0],
+                [0.2, 0, 0],
+                [-0.5, 0.4, 0],
+                [0.5, 0.4, 0],
+                [-0.2, -1, 0],
+                [0.2, -1, 0],
+            ],
+            joint_parents=[-1, 0, 0, 1, 2, 1, 2],
+            joint_names=[
+                "Hips",
+                "LeftLeg",
+                "RightLeg",
+                "LeftHand",
+                "RightHand",
+                "LeftFoot",
+                "RightFoot",
+            ],
+            hip_joint_idx=[2, 1],
+            left_hand_joint_idx=[3],
+            right_hand_joint_idx=[4],
+            left_foot_joint_idx=[5, 5],
+            right_foot_joint_idx=[6, 6],
+        )
+
+    def test_forward_kinematics_and_representation_roundtrip(self):
+        from mlx_vlm.models.kimodo.geometry import angle_to_y_rotation_matrix
+        from mlx_vlm.models.kimodo.motion import ArdyMotionRep
+
+        skeleton = self.skeleton()
+        rotation = angle_to_y_rotation_matrix(mx.array(0.7))
+        local = mx.broadcast_to(mx.eye(3), (2, 5, 7, 3, 3))
+        local = mx.array(local)
+        local[..., 0, :, :] = rotation
+        root = mx.random.normal((2, 5, 3))
+        global_rots, positions, no_root = skeleton.fk(local, root)
+        expected = (rotation @ skeleton.neutral_joints[..., None])[..., 0]
+        assert mx.allclose(no_root, expected, atol=1e-6)
+        assert mx.allclose(positions[..., 0, :], root)
+        rep = ArdyMotionRep(skeleton)
+        features = rep(local, root, to_normalize=True, lengths=mx.array([5, 3]))
+        decoded = rep.inverse(features, is_normalized=True, return_all=True)
+        assert mx.allclose(decoded["global_rot_mats"], global_rots, atol=1e-6)
+        assert mx.allclose(decoded["posed_joints"], positions, atol=1e-6)
+        assert mx.allclose(decoded["all_positions"]["positions"], positions, atol=1e-6)
+        assert mx.allclose(
+            skeleton.global_rots_to_local_rots(global_rots), local, atol=1e-6
+        )
+
+    def test_variable_lengths_and_heading_wrap(self):
+        from mlx_vlm.models.kimodo.motion import KimodoMotionRep
+
+        rep = KimodoMotionRep(self.skeleton(), fps=10)
+        angles = mx.array([[3.0, -3.0, -2.8, -2.7], [0.0, 0.1, 0.3, 0.8]])
+        positions = mx.stack(
+            (mx.broadcast_to(mx.arange(4), (2, 4)), mx.ones((2, 4)), mx.zeros((2, 4))),
+            axis=-1,
+        )
+        root = mx.concatenate(
+            (positions, mx.cos(angles)[..., None], mx.sin(angles)[..., None]), axis=-1
+        )
+        local = rep.global_root_to_local_root(
+            root, normalized=False, lengths=mx.array([4, 2])
+        )
+        assert mx.allclose(local[0, 0, 0], mx.array((2 * math.pi - 6) * 10), atol=1e-5)
+        assert mx.allclose(local[:, :2, 1], mx.array(10.0))
+        assert mx.allclose(local[1, 1], local[1, 0])
+        assert mx.allclose(local[0, -1], local[0, -2])
+        restored = rep.local_root_to_global_root(local, normalized=False)
+        assert mx.allclose(restored[0, :, :3], positions[0] - mx.array([0, 0, 0]))
+        assert mx.allclose(
+            rep.get_root_heading_angle(restored)[0],
+            mx.array([0, 2 * math.pi - 6, 2 * math.pi - 5.8, 2 * math.pi - 5.7]),
+            atol=1e-5,
+        )
+
+    def test_sparse_conditions_preserve_reference_layouts(self):
+        from mlx_vlm.models.kimodo.motion import ArdyMotionRep, KimodoMotionRep
+
+        for cls in (KimodoMotionRep, ArdyMotionRep):
+            rep = cls(self.skeleton())
+            stats = {
+                name
+                + "."
+                + key: (mx.ones((size,)) if key == "std" else mx.full((size,), 2.0))
+                for name, size in (
+                    ("global_root", 5),
+                    ("local_root", 4),
+                    ("body", rep.body_dim),
+                )
+                for key in ("mean", "std")
+            }
+            rep.set_stats(stats)
+            obs, mask = rep.create_conditions(
+                {
+                    "smooth_root_2d": [mx.array([1])],
+                    "global_joints_positions": [mx.array([[1, 0], [1, 3]])],
+                },
+                {
+                    "smooth_root_2d": [mx.array([[4.0, 6.0]])],
+                    "global_joints_positions": [
+                        mx.array([[4.0, 1.0, 6.0], [5.0, 2.0, 9.0]])
+                    ],
+                },
+                3,
+                to_normalize=True,
+            )
+            assert mask.shape == (3, rep.motion_rep_dim)
+            assert mask.dtype == (mx.float32 if rep._ardy else mx.bool_)
+            assert mx.all(mask[1, [0, 2]])
+            start = (
+                rep.slice_dict["local_joints_positions"].start
+                + (3 - int(rep._ardy)) * 3
+            )
+            raw = rep.unnormalize(obs)
+            assert mx.allclose(
+                raw[1, start : start + 3], mx.array([1.0, 2.0, 3.0]), atol=1e-6
+            )
+            if rep._ardy:
+                assert mx.all(obs[0] == 0)
+            else:
+                assert mx.allclose(
+                    obs[0], rep.normalize(mx.zeros((rep.motion_rep_dim,)))
+                )
+
+    def test_native_constraints_and_lazy_batch_adapter(self):
+        from unittest.mock import patch
+
+        from mlx_vlm.models.kimodo.motion import KimodoMotionRep
+
+        rep = KimodoMotionRep(self.skeleton())
+        constraints = [
+            {
+                "type": "fullbody",
+                "frame_indices": [1],
+                "local_joints_rot": [[[0.0, 0.0, 0.0]] * 7],
+                "root_positions": [[3.0, 1.0, 4.0]],
+            }
+        ]
+        with (
+            patch.object(mx, "eval", side_effect=AssertionError("eager evaluation")),
+            patch.object(
+                mx, "synchronize", side_effect=AssertionError("GPU synchronization")
+            ),
+        ):
+            observed, mask = rep.create_conditions_from_constraints_batched(
+                [constraints, []], [3, 2]
+            )
+            decoded = rep.inverse(
+                observed,
+                is_normalized=True,
+                posed_joints_from="positions",
+                need_local_rots=False,
+            )
+        assert observed.shape == (2, 3, rep.motion_rep_dim)
+        assert mx.all(mask[0, 1, :5])
+        assert mx.all(mask[1] == 0)
+        assert mx.allclose(
+            decoded["posed_joints"][0, 1],
+            rep.skeleton.neutral_joints + mx.array([3.0, 1.0, 4.0]),
+            atol=1e-6,
+        )
+
+    def test_soma_output_expansion(self):
+        from mlx_vlm.models.kimodo.motion import Skeleton
+
+        expanded = dict(
+            neutral_joints=[[0, 0, 0], [1, 0, 0], [2, 0, 0]], joint_parents=[-1, 0, 1]
+        )
+        skeleton = Skeleton(
+            [[0, 0, 0], [2, 0, 0]],
+            [-1, 0],
+            output_skeleton=expanded,
+            output_joint_indices=[0, 2],
+            output_rest_local_rots=mx.broadcast_to(mx.eye(3), (3, 3, 3)),
+        )
+        local = mx.broadcast_to(mx.eye(3), (1, 2, 3, 3))
+        result = skeleton.output_to_SOMASkeleton77(
+            {
+                "local_rot_mats": local,
+                "root_positions": mx.array([[2, 3, 4]]),
+                "foot_contacts": mx.array([[True, False, False, True]]),
+            }
+        )
+        assert result["local_rot_mats"].shape == (1, 3, 3, 3)
+        assert mx.array_equal(
+            result["posed_joints"], mx.array([[[2, 3, 4], [3, 3, 4], [4, 3, 4]]])
+        )
+        assert mx.array_equal(
+            result["foot_contacts"], mx.array([[True, False, False, False, True, True]])
+        )
+
+
+class TestKimodoMultiPrompt:
+    @staticmethod
+    def pipeline():
+        from mlx_vlm.models.kimodo import KimodoPipeline, Model, ModelConfig
+        from mlx_vlm.models.kimodo.motion import KimodoMotionRep
+
+        class Encoder:
+            def __call__(self, texts):
+                return mx.zeros((len(texts), 2, 8)), [2] * len(texts)
+
+        config = ModelConfig(
+            latent_dim=16,
+            ff_size=24,
+            num_layers=1,
+            num_heads=4,
+            llm_shape=(1, 8),
+            num_text_tokens_override=2,
+            num_base_steps=8,
+            max_position_embeddings=64,
+        )
+        model = Model(config, KimodoMotionRep(TestKimodoMotion.skeleton()))
+        model.eval()
+        return KimodoPipeline(model, Encoder())
+
+    def test_single_segment_matches_regular_generation(self):
+        pipeline = self.pipeline()
+        sequential = pipeline.generate(
+            ["Walk"], [7], 3, seed=17, multi_prompt=True, return_features=True
+        )
+        regular = pipeline.generate("Walk", 7, 3, seed=17, return_features=True)
+        assert sequential.shape == regular.shape
+        assert mx.allclose(sequential, regular, atol=1e-5)
+
+    @pytest.mark.parametrize("num_samples", [None, 2])
+    @pytest.mark.parametrize("with_mask", [False, True])
+    @pytest.mark.parametrize(
+        "prompts, frames", [(["Walk"], [7]), (["Walk", "Turn"], [7, 6])]
+    )
+    def test_precomputed_text_conditioning(
+        self, num_samples, with_mask, prompts, frames
+    ):
+        pipeline = self.pipeline()
+        pipeline.text_encoder = None
+        text = mx.ones((num_samples or 1, 2, 8))
+        mask = (
+            mx.broadcast_to(mx.array([[True, False]]), text.shape[:2])
+            if with_mask
+            else None
+        )
+        with (
+            patch.object(
+                pipeline, "_encoder", side_effect=AssertionError("text encoder loaded")
+            ),
+            patch.object(pipeline, "sample", wraps=pipeline.sample) as sample,
+            patch.object(mx, "eval", side_effect=AssertionError("eager evaluation")),
+        ):
+            result = pipeline.generate(
+                prompts,
+                frames,
+                3,
+                multi_prompt=True,
+                num_samples=num_samples,
+                text_features=text,
+                text_mask=mask,
+                return_features=True,
+            )
+        assert sample.call_count == len(prompts)
+        for call in sample.call_args_list:
+            assert call.args[0] is text
+            expected_mask = mask if with_mask else mx.ones(text.shape[:2], mx.bool_)
+            assert mx.array_equal(call.args[1], expected_mask)
+        shape = (sum(frames), pipeline.motion_rep.motion_rep_dim)
+        assert result.shape == (shape if num_samples is None else (num_samples, *shape))
+        assert mx.all(mx.isfinite(result))
+
+    def test_constraints_and_three_segment_stitching_stay_lazy(self):
+        pipeline = self.pipeline()
+        constraints = [
+            {
+                "type": "root2d",
+                "frame_indices": [0, 5, 11, 17],
+                "smooth_root_2d": [[0, 0], [0, 1], [1, 2], [2, 2]],
+            }
+        ]
+        with (
+            patch.object(mx, "eval", side_effect=AssertionError("eager evaluation")),
+            patch.object(
+                mx, "synchronize", side_effect=AssertionError("GPU synchronization")
+            ),
+            patch.object(np, "array", side_effect=AssertionError("host transfer")),
+        ):
+            result = pipeline.generate(
+                ["Walk", "Turn", "Stop"],
+                [6, 7, 5],
+                3,
+                seed=17,
+                multi_prompt=True,
+                num_samples=2,
+                num_transition_frames=3,
+                constraint_lst=constraints,
+            )
+        assert result["posed_joints"].shape == (2, 18, 7, 3)
+        assert result["root_positions"].shape == (2, 18, 3)
+        assert all(isinstance(value, mx.array) for value in result.values())
+        assert all(mx.all(mx.isfinite(value)) for value in result.values())
+
+    def test_transition_length_validation(self):
+        pipeline = self.pipeline()
+        with pytest.raises(ValueError, match="transition"):
+            pipeline.generate(
+                ["Walk", "Turn"], [2, 4], 1, multi_prompt=True, num_transition_frames=3
+            )
+
+
+class TestKimodoTrajectory:
+    @staticmethod
+    def reference_solve(reference, observations, margins, iterations=100):
+        """Independent dense double-precision form of the source ADMM system."""
+        frames = reference.shape[0]
+        identity = np.eye(frames)
+        velocity = np.diff(identity, axis=0)
+        acceleration = np.diff(identity, n=2, axis=0)
+        normal = (
+            float(np.float32(0.001)) * identity
+            + velocity.T @ velocity
+            + 10.0 * acceleration.T @ acceleration
+        )
+        hard, soft = margins == 0, margins > 0
+        if not np.any(hard | soft):
+            return reference.copy()
+        free = ~hard
+        rho = float(np.float32(0.5) * np.sqrt(np.float32(normal.diagonal().max())))
+        system = normal + rho * np.diag(soft.astype(float))
+        inverse = np.linalg.inv(system[np.ix_(free, free)])
+        rhs = normal @ (reference - np.where(hard[:, None], observations, 0))
+        result = reference.copy()
+        z = reference[soft].copy()
+        u = np.zeros_like(z)
+        for _ in range(iterations if np.any(soft) else 1):
+            current_rhs = rhs.copy()
+            current_rhs[soft] += rho * (z - u)
+            result[free] = inverse @ current_rhs[free]
+            result[hard] = observations[hard]
+            difference = result[soft] + u - observations[soft]
+            norm = np.linalg.norm(difference, axis=-1, keepdims=True)
+            z = observations[soft] + difference * np.minimum(
+                1.0, margins[soft, None] / np.maximum(norm, 1e-30)
+            )
+            u += result[soft] - z
+        return result
+
+    @pytest.mark.parametrize(
+        "frames,channels", [(1, 1), (2, 3), (3, 6), (24, 2), (40, 65)]
+    )
+    @pytest.mark.parametrize(
+        "constraint", ["free", "hard", "margin", "mixed", "allhard"]
+    )
+    def test_gpu_band_solve_matches_independent_dense_admm(
+        self, frames, channels, constraint
+    ):
+        from mlx_vlm.models.kimodo.trajectory import trajectory_correct
+
+        rng = np.random.default_rng(71)
+        reference = rng.normal(size=(frames, channels)).astype(np.float32)
+        observations = rng.normal(size=(frames, channels)).astype(np.float32)
+        margins = np.full(frames, -1.0, dtype=np.float32)
+        selected = np.arange(frames) % 7 == 0
+        if constraint in ("hard", "mixed"):
+            margins[selected] = 0
+        if constraint == "margin":
+            margins[selected] = 0.2
+        if constraint == "mixed":
+            margins[np.arange(frames) % 7 == 3] = 0.2
+        if constraint == "allhard":
+            margins[:] = 0
+        actual = trajectory_correct(
+            mx.array(reference), mx.array(observations), mx.array(margins)
+        )
+        expected = self.reference_solve(
+            reference.astype(float), observations.astype(float), margins
+        )
+        np.testing.assert_allclose(np.array(actual), expected, atol=5e-4, rtol=5e-5)
+        np.testing.assert_array_equal(
+            np.array(actual)[margins == 0], observations[margins == 0]
+        )
+        if constraint == "free":
+            np.testing.assert_array_equal(np.array(actual), reference)
+
+    def test_broadcast_batch_and_solver_build_remain_lazy(self):
+        from mlx_vlm.models.kimodo.trajectory import smooth_channels, trajectory_correct
+
+        reference = mx.arange(48, dtype=mx.float32).reshape(2, 1, 8, 3) * 0.01
+        observations = mx.zeros((8, 3))
+        margins = mx.array([[0, -1, -1, 0.2, -1, -1, -1, 0], [-1] * 8])
+        with (
+            patch.object(mx, "eval", side_effect=AssertionError("eager evaluation")),
+            patch.object(
+                mx, "synchronize", side_effect=AssertionError("GPU synchronization")
+            ),
+            patch.object(np, "array", side_effect=AssertionError("host transfer")),
+        ):
+            result = trajectory_correct(reference, observations, margins)
+            smoothed = smooth_channels(result, margins >= 0)
+        assert result.shape == (2, 2, 8, 3)
+        assert smoothed.shape == result.shape
+        assert mx.all(mx.isfinite(smoothed))
+        assert mx.array_equal(result[:, 1], reference[:, 0])
+
+    def test_boundary_smoothing_matches_time_ordered_in_place_scan(self):
+        from mlx_vlm.models.kimodo.trajectory import smooth_channels
+
+        rng = np.random.default_rng(18)
+        reference = rng.normal(size=(2, 13, 6)).astype(np.float32)
+        mask = np.array(
+            [
+                [1, 0, 1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1],
+                [0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 1],
+            ],
+            dtype=np.float32,
+        )
+        expected = reference.copy()
+        for b in range(2):
+            for t in range(13):
+                previous, following = max(0, t - 1), min(12, t + 1)
+                if t > 0 and mask[b, t] > 0 and mask[b, previous] == 0:
+                    expected[b, t] = 0.5 * (
+                        expected[b, previous] + expected[b, following]
+                    )
+                if mask[b, t] > 0 and mask[b, following] == 0:
+                    expected[b, t] = 0.5 * (
+                        expected[b, previous] + expected[b, following]
+                    )
+        actual = smooth_channels(mx.array(reference), mx.array(mask))
+        np.testing.assert_array_equal(np.array(actual), expected)
+
+
+class TestKimodoContactCleanup:
+    @staticmethod
+    def rig():
+        from mlx_vlm.models.kimodo.contact_cleanup import CleanupRig
+
+        return CleanupRig(
+            (-1, 0, 1),
+            mx.array([[0, 0, 0], [0, -1, 0.1], [0, -1, -0.1]], mx.float32),
+        )
+
+    @pytest.mark.parametrize("one_bone", [False, True])
+    def test_gpu_contact_intervals_match_source_boundary_rules(self, one_bone):
+        from mlx_vlm.models.kimodo.contact_cleanup import contact_intervals
+
+        contacts = np.array(
+            [
+                [1, 1, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1],
+                [0, 1, 0, 0, 1, 1, 0, 1, 1, 1, 1, 1],
+            ],
+            dtype=np.float32,
+        )
+        mask = np.array(
+            [
+                [0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0],
+                [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ],
+            dtype=bool,
+        )
+        expected_active = np.zeros_like(contacts)
+        expected_frames = np.broadcast_to(np.arange(12), (2, 12)).copy()
+        expected_boundary = np.zeros_like(mask)
+        for b in range(2):
+            start = None
+            for frame in range(13):
+                active = frame < 12 and contacts[b, frame] > 0.5 and not mask[b, frame]
+                if active and start is None:
+                    start = frame
+                elif not active and start is not None:
+                    sc = start > 0 and mask[b, start - 1]
+                    ec = frame < 12 and mask[b, frame]
+                    if not (sc or ec if one_bone else sc and ec):
+                        representative = (
+                            start - 1 if sc else frame if ec else (start + frame) // 2
+                        )
+                        expected_active[b, start:frame] = 1
+                        expected_frames[b, start:frame] = representative
+                        expected_boundary[b, start:frame] = sc or ec
+                    start = None
+        active, frames, boundary = contact_intervals(
+            mx.array(contacts), mx.array(mask), one_bone=one_bone
+        )
+        np.testing.assert_array_equal(np.array(active), expected_active)
+        np.testing.assert_array_equal(np.array(frames), expected_frames)
+        np.testing.assert_array_equal(np.array(boundary), expected_boundary)
+
+    def test_metal_two_bone_reaches_target_and_zero_weight_is_identity(self):
+        from mlx_vlm.models.kimodo.ik import one_bone_ik, two_bone_ik
+        from mlx_vlm.models.kimodo.ik_kernels import joint_global
+
+        rig = self.rig()
+        rotations = mx.broadcast_to(mx.eye(3), (2, 4, 3, 3, 3))
+        roots = mx.zeros((2, 4, 3))
+        target = mx.broadcast_to(mx.array([0.3, -1.7, 0.2]), roots.shape)
+        corrected = two_bone_ik(rotations, roots, rig, 2, target)
+        _, position = joint_global(corrected, roots, rig, 2)
+        np.testing.assert_allclose(np.array(position), np.array(target), atol=3e-6)
+        np.testing.assert_array_equal(
+            np.array(two_bone_ik(rotations, roots, rig, 2, target, weight=0.0)),
+            np.array(rotations),
+        )
+        np.testing.assert_array_equal(
+            np.array(one_bone_ik(rotations, roots, rig, 2, target, weight=0.0)),
+            np.array(rotations),
+        )
+
+    @pytest.mark.parametrize("target", [[0, -4, 0], [0, 0, 0], [0, 2, 0]])
+    def test_metal_solvers_remain_finite_at_collinear_or_unreachable_targets(
+        self, target
+    ):
+        from mlx_vlm.models.kimodo.contact_cleanup import CleanupRig
+        from mlx_vlm.models.kimodo.ik import one_bone_ik, two_bone_ik
+
+        rig = CleanupRig(
+            (-1, 0, 1), mx.array([[0, 0, 0], [0, -1, 0], [0, -1, 0]], mx.float32)
+        )
+        rotations = mx.broadcast_to(mx.eye(3), (1, 3, 3, 3, 3))
+        roots = mx.zeros((1, 3, 3))
+        targets = mx.broadcast_to(mx.array(target, mx.float32), roots.shape)
+        for solver in (one_bone_ik, two_bone_ik):
+            result = solver(rotations, roots, rig, 2, targets)
+            assert mx.all(mx.isfinite(result))
+            gram = mx.swapaxes(result, -1, -2) @ result
+            assert mx.allclose(gram, mx.eye(3), atol=2e-5)
+
+    def test_effector_pin_restores_global_rotation_and_builds_without_evaluation(self):
+        from mlx_vlm.models.kimodo.contact_cleanup import (
+            TWO_BONE,
+            ContactInfo,
+            do_effector_ik,
+        )
+        from mlx_vlm.models.kimodo.geometry import angle_to_y_rotation_matrix
+        from mlx_vlm.models.kimodo.ik_kernels import joint_global
+
+        rig = self.rig()
+        rotations = mx.broadcast_to(mx.eye(3), (1, 5, 3, 3, 3))
+        roots = mx.zeros((1, 5, 3))
+        target_rotations = mx.array(rotations)
+        target_rotations[..., 2, :, :] = angle_to_y_rotation_matrix(
+            mx.full((1, 5), 0.4)
+        )
+        target_roots = mx.broadcast_to(mx.array([0.2, 0.1, 0.05]), roots.shape)
+        pins = [ContactInfo(2, TWO_BONE, mx.ones((1, 5), mx.bool_))]
+        with (
+            patch.object(mx, "eval", side_effect=AssertionError("eager evaluation")),
+            patch.object(
+                mx, "synchronize", side_effect=AssertionError("GPU synchronization")
+            ),
+            patch.object(np, "array", side_effect=AssertionError("host transfer")),
+        ):
+            result = do_effector_ik(
+                rotations,
+                roots,
+                target_rotations,
+                target_roots,
+                mx.zeros((1, 5), mx.bool_),
+                pins,
+                rig,
+            )
+        actual_rotation, _ = joint_global(result, roots, rig, 2)
+        target_rotation, _ = joint_global(target_rotations, target_roots, rig, 2)
+        np.testing.assert_allclose(
+            np.array(actual_rotation), np.array(target_rotation), atol=3e-6
+        )
+
+
+class TestKimodoPostprocess:
+    @staticmethod
+    def skeleton():
+        from mlx_vlm.models.kimodo.motion import Skeleton
+
+        return Skeleton(
+            name="somaskel_test",
+            joint_parents=[-1, 0, 1, 2, 3, 4, 1, 6, 7, 8, 0, 10, 11, 12, 0, 14, 15, 16],
+            neutral_joints=[
+                [0, 0, 0],
+                [0, 0.2, 0],
+                [-0.2, 0.4, 0],
+                [-0.3, 0.4, 0],
+                [-0.6, 0.35, 0],
+                [-0.8, 0.4, 0],
+                [0.2, 0.4, 0],
+                [0.3, 0.4, 0],
+                [0.6, 0.35, 0],
+                [0.8, 0.4, 0],
+                [-0.1, -0.05, 0],
+                [-0.1, -0.5, 0.18],
+                [-0.1, -0.95, 0],
+                [-0.1, -1, 0.15],
+                [0.1, -0.05, 0],
+                [0.1, -0.5, 0.18],
+                [0.1, -0.95, 0],
+                [0.1, -1, 0.15],
+            ],
+            joint_names=[
+                "Hips",
+                "Spine",
+                "LeftShoulder",
+                "LeftArm",
+                "LeftForeArm",
+                "LeftHand",
+                "RightShoulder",
+                "RightArm",
+                "RightForeArm",
+                "RightHand",
+                "LeftLeg",
+                "LeftKnee",
+                "LeftFoot",
+                "LeftToe",
+                "RightLeg",
+                "RightKnee",
+                "RightFoot",
+                "RightToe",
+            ],
+            hip_joint_idx=[14, 10],
+            left_hand_joint_idx=[5],
+            right_hand_joint_idx=[9],
+            left_foot_joint_idx=[12, 13],
+            right_foot_joint_idx=[16, 17],
+        )
+
+    def motion(self, frames=12, batch=1):
+        skel = self.skeleton()
+        local = mx.broadcast_to(mx.eye(3), (batch, frames, skel.nbjoints, 3, 3))
+        time = mx.arange(frames, dtype=mx.float32)
+        roots = mx.broadcast_to(
+            mx.stack((0.01 * time, 1.05 + time * 0, 0.015 * time), axis=-1),
+            (batch, frames, 3),
+        )
+        contacts = mx.ones((batch, frames, 4), mx.bool_)
+        return skel, local, roots, contacts
+
+    def test_native_constraint_targets_and_crop_stay_lazy(self):
+        from mlx_vlm.models.kimodo.postprocess import (
+            crop_constraints,
+            prepare_constraint_targets,
+        )
+
+        skel, local, roots, contacts = self.motion()
+        global_rots, positions, _ = skel.fk(local, roots)
+        constraints = [
+            dict(
+                type="fullbody",
+                frame_indices=[3],
+                global_joints_rots=global_rots[0, 3:4],
+                global_joints_positions=positions[0, 3:4],
+                smooth_root_2d=mx.array([[9.0, 8.0]]),
+            ),
+            dict(
+                type="root2d",
+                frame_indices=[1, 3, 99],
+                smooth_root_2d=[[2.0, 3.0], [4.0, 5.0], [99.0, 99.0]],
+            ),
+        ]
+        with patch.object(mx, "eval", side_effect=AssertionError("eager evaluation")):
+            targets, rotations, masks = prepare_constraint_targets(
+                constraints, skel, 12, 1
+            )
+            cropped = prepare_constraint_targets(
+                crop_constraints(constraints, 2, 8), skel, 6, 1
+            )
+        assert mx.array_equal(targets[0, 1], mx.array([2.0, 0.0, 3.0]))
+        assert mx.allclose(targets[0, 3], roots[0, 3])
+        assert masks["FullBody"][0, 3]
+        assert masks["Root"][0, 1] and masks["Root"][0, 3]
+        assert mx.allclose(cropped[0][0, 1], roots[0, 3])
+        assert not cropped[2]["Root"][0, -1]
+
+    @pytest.mark.parametrize(
+        "joint_names",
+        [
+            ["LeftHand"],
+            ["RightHand"],
+            ["LeftFoot"],
+            ["RightFoot"],
+            ["LeftHand", "RightFoot", "Hips"],
+        ],
+    )
+    def test_generic_end_effector_masks_activate_pins(self, joint_names):
+        from mlx_vlm.models.kimodo.postprocess import (
+            _contacts_and_pins,
+            create_cleanup_rig,
+            prepare_constraint_targets,
+        )
+
+        skel, local, roots, contacts = self.motion(batch=2)
+        global_rots, positions, _ = skel.fk(local, roots)
+        pose = dict(
+            frame_indices=[2, 4, 99],
+            global_joints_rots=global_rots[0, :3],
+            global_joints_positions=positions[0, :3],
+        )
+        fullbody = dict(
+            type="fullbody",
+            frame_indices=[4],
+            global_joints_rots=global_rots[0, 4:5],
+            global_joints_positions=positions[0, 4:5],
+        )
+        constraints = [
+            [dict(pose, type="end-effector", joint_names=joint_names), fullbody],
+            [],
+        ]
+        with patch.object(mx, "eval", side_effect=AssertionError("eager evaluation")):
+            _, _, masks = prepare_constraint_targets(constraints, skel, 12, 2)
+            _, pins = _contacts_and_pins(
+                skel, contacts, masks, create_cleanup_rig(skel)
+            )
+        for name in ("LeftHand", "RightHand", "LeftFoot", "RightFoot", "Root"):
+            active = ("Hips" if name == "Root" else name) in joint_names
+            expected = mx.array(
+                [[active and i in (2, 4) for i in range(12)], [False] * 12]
+            )
+            assert mx.array_equal(masks[name], expected)
+        for name, pin in zip(("LeftHand", "RightHand", "LeftFoot", "RightFoot"), pins):
+            assert mx.array_equal(pin.mask, masks[name] & ~masks["FullBody"])
+
+    def test_generic_end_effector_cleanup_matches_named_constraint(self):
+        from mlx_vlm.models.kimodo import post_process_motion
+
+        skel, local, roots, contacts = self.motion()
+        target_roots = roots + mx.array([0.02, 0, 0])
+        global_rots, positions, _ = skel.fk(local, target_roots)
+        pose = dict(
+            frame_indices=list(range(12)),
+            global_joints_rots=global_rots[0],
+            global_joints_positions=positions[0],
+        )
+        generic = post_process_motion(
+            local,
+            roots,
+            contacts,
+            skel,
+            [dict(pose, type="end-effector", joint_names=["LeftHand"])],
+        )
+        named = post_process_motion(
+            local, roots, contacts, skel, [dict(pose, type="left-hand")]
+        )
+        for name, value in generic.items():
+            assert mx.allclose(value, named[name], atol=1e-6)
+        initial_hand = skel.fk(local, roots)[1][..., 5, :]
+        target_hand = positions[..., 5, :]
+        initial_error = mx.linalg.norm(initial_hand - target_hand, axis=-1)
+        corrected_error = mx.linalg.norm(
+            generic["posed_joints"][..., 5, :] - target_hand, axis=-1
+        )
+        assert mx.all(corrected_error < initial_error)
+
+    def test_cleanup_batch_matches_individual_and_preserves_inputs(self):
+        from mlx_vlm.models.kimodo import post_process_motion
+
+        skel, local, roots, contacts = self.motion(batch=2)
+        before = mx.array(local)
+        with (
+            patch.object(mx, "eval", side_effect=AssertionError("eager evaluation")),
+            patch.object(mx, "synchronize", side_effect=AssertionError("synchronize")),
+            patch.object(np, "array", side_effect=AssertionError("host transfer")),
+        ):
+            corrected = post_process_motion(local, roots, contacts, skel)
+        single = post_process_motion(local[0], roots[0], contacts[0], skel)
+        assert mx.array_equal(local, before)
+        for name, value in corrected.items():
+            assert isinstance(value, mx.array)
+            assert mx.all(mx.isfinite(value))
+            assert mx.allclose(value[0], single[name], atol=2e-6)
+            assert mx.allclose(value[0], value[1], atol=2e-6)
+        assert mx.array_equal(corrected["root_positions"], roots)
+        before_joints = skel.fk(local, roots)[1]
+        before_drift = mx.mean(
+            mx.abs(before_joints[:, 1:, 12, 0] - before_joints[:, :-1, 12, 0])
+        )
+        after_drift = mx.mean(
+            mx.abs(
+                corrected["posed_joints"][:, 1:, 12, 0]
+                - corrected["posed_joints"][:, :-1, 12, 0]
+            )
+        )
+        assert after_drift < before_drift * 0.5
+
+    def test_hard_fullbody_targets_are_preserved(self):
+        from mlx_vlm.models.kimodo import post_process_motion
+
+        skel, local, roots, contacts = self.motion()
+        target_root = roots + mx.array([0.02, 0.01, -0.025])
+        global_rots, positions, _ = skel.fk(local, target_root)
+        constraints = [
+            dict(
+                type="fullbody",
+                frame_indices=list(range(12)),
+                global_joints_rots=global_rots[0],
+                global_joints_positions=positions[0],
+            )
+        ]
+        corrected = post_process_motion(local, roots, contacts, skel, constraints)
+        assert mx.array_equal(corrected["root_positions"], target_root)
+        assert mx.allclose(corrected["local_rot_mats"], local, atol=1e-6)
+        assert mx.allclose(corrected["posed_joints"], positions, atol=1e-6)
+
+    def test_pipeline_cleanup_is_opt_in_and_lazy(self):
+        from mlx_vlm.models.kimodo import KimodoPipeline, Model, ModelConfig
+        from mlx_vlm.models.kimodo.motion import KimodoMotionRep
+        from mlx_vlm.models.kimodo.postprocess import post_process_motion
+
+        skel, local, roots, contacts = self.motion()
+        rep = KimodoMotionRep(skel)
+        config = ModelConfig(
+            latent_dim=16,
+            ff_size=24,
+            num_layers=1,
+            num_heads=4,
+            llm_shape=(1, 16),
+            num_base_steps=16,
+            max_position_embeddings=64,
+            num_text_tokens_override=3,
+        )
+        pipeline = KimodoPipeline(Model(config, rep))
+        features = rep(local, roots, lengths=mx.array([12]), to_normalize=True)
+        text = mx.zeros((1, 1, 16))
+        with patch.object(pipeline, "sample", return_value=features):
+            plain = pipeline.generate("walk", 12, 4, text_features=text)
+            with patch(
+                "mlx_vlm.models.kimodo.postprocess.post_process_motion",
+                wraps=post_process_motion,
+            ) as cleanup:
+                disabled = pipeline.generate(
+                    "walk", 12, 4, text_features=text, post_processing=False
+                )
+                cleanup.assert_not_called()
+                with (
+                    patch.object(
+                        mx, "eval", side_effect=AssertionError("eager evaluation")
+                    ),
+                    patch.object(
+                        mx, "synchronize", side_effect=AssertionError("synchronize")
+                    ),
+                ):
+                    corrected = pipeline.generate(
+                        "walk", 12, 4, text_features=text, post_processing=True
+                    )
+                cleanup.assert_called_once()
+        assert mx.array_equal(plain["posed_joints"], disabled["posed_joints"])
+        assert corrected["posed_joints"].shape == (12, skel.nbjoints, 3)
+        assert mx.all(mx.isfinite(corrected["posed_joints"]))
+
+    @pytest.mark.parametrize("multi_prompt", [False, True])
+    @pytest.mark.parametrize("threshold", [0.0, 0.5, 0.9, 1.0])
+    def test_pipeline_cleanup_uses_contact_threshold(self, multi_prompt, threshold):
+        from mlx_vlm.models.kimodo import KimodoPipeline, Model, ModelConfig
+        from mlx_vlm.models.kimodo.motion import KimodoMotionRep
+
+        skel = self.skeleton()
+        rep = KimodoMotionRep(skel)
+        config = ModelConfig(
+            latent_dim=16,
+            ff_size=24,
+            num_layers=1,
+            num_heads=4,
+            llm_shape=(1, 16),
+            num_base_steps=16,
+            max_position_embeddings=64,
+            num_text_tokens_override=3,
+        )
+        pipeline = KimodoPipeline(Model(config, rep))
+        scores = mx.array([0.0, 0.4, 0.6, 1.0])
+
+        def sample(text_features, text_mask, lengths, steps, **kwargs):
+            _, local, roots, _ = self.motion(frames=max(lengths), batch=len(lengths))
+            features = rep(local, roots, lengths=mx.array(lengths), to_normalize=False)
+            features = mx.array(features)
+            features[..., rep.slice_dict["foot_contacts"]] = scores
+            return rep.normalize(features)
+
+        def cleanup(local, roots, *args, **kwargs):
+            return {"local_rot_mats": local, "root_positions": roots}
+
+        with (
+            patch.object(pipeline, "sample", side_effect=sample),
+            patch(
+                "mlx_vlm.models.kimodo.postprocess.post_process_motion",
+                side_effect=cleanup,
+            ) as clean,
+        ):
+            pipeline.generate(
+                ["Walk", "Wave"] if multi_prompt else "Walk",
+                12,
+                4,
+                text_features=mx.zeros((1, 1, 16)),
+                multi_prompt=multi_prompt,
+                post_processing=True,
+                contact_threshold=threshold,
+            )
+        assert clean.call_count == (2 if multi_prompt else 1)
+        for call in clean.call_args_list:
+            labels = call.args[2]
+            assert mx.array_equal(
+                labels, mx.broadcast_to(scores > threshold, labels.shape)
+            )
+            assert call.kwargs["contact_threshold"] == threshold
+
+    @pytest.mark.parametrize("unbatched", [False, True])
+    def test_compiled_cleanup_tracks_targets_masks_and_options(self, unbatched):
+        from mlx_vlm.models.kimodo import post_process_motion
+
+        skel, local, roots, _ = self.motion(batch=2)
+        contacts = mx.broadcast_to(mx.array([0.6, 0.1, 0.8, 0.9]), (2, 12, 4))
+        target_roots = roots + mx.array([0.02, 0.01, -0.02])
+        global_rots, positions, _ = skel.fk(local, target_roots)
+        pose = dict(
+            frame_indices=list(range(12)),
+            global_joints_rots=global_rots[0],
+            global_joints_positions=positions[0],
+        )
+        if unbatched:
+            local, roots, contacts = local[0], roots[0], contacts[0]
+        cases = [
+            (None, 0.5, 0.04),
+            ([dict(pose, type="end-effector", joint_names=["LeftHand"])], 0.9, 0.0),
+            ([dict(pose, type="fullbody")], 0.1, 0.1),
+        ]
+        for constraints, threshold, margin in cases:
+            kwargs = dict(
+                constraint_lst=constraints,
+                contact_threshold=threshold,
+                root_margin=margin,
+            )
+            eager = post_process_motion(local, roots, contacts, skel, **kwargs)
+            with (
+                patch.object(
+                    mx, "eval", side_effect=AssertionError("eager evaluation")
+                ),
+                patch.object(
+                    mx, "synchronize", side_effect=AssertionError("synchronize")
+                ),
+            ):
+                compiled = post_process_motion(
+                    local, roots, contacts, skel, compile=True, **kwargs
+                )
+            for name, value in eager.items():
+                assert mx.allclose(compiled[name], value, atol=1e-5, rtol=1e-5)
+        assert mx.array_equal(
+            compiled["root_positions"], target_roots[0] if unbatched else target_roots
+        )
+        # A new duration must retrace shape-dependent kernels.
+        short = post_process_motion(
+            local[..., :1, :, :, :],
+            roots[..., :1, :],
+            contacts[..., :1, :],
+            skel,
+            compile=True,
+        )
+        assert mx.all(mx.isfinite(short["posed_joints"]))
+
+    def test_short_motion_and_validation(self):
+        from mlx_vlm.models.kimodo import post_process_motion
+
+        skel, local, roots, contacts = self.motion(frames=1)
+        result = post_process_motion(local, roots, contacts, skel)
+        assert mx.all(mx.isfinite(result["posed_joints"]))
+        with pytest.raises(ValueError):
+            post_process_motion(local, roots, contacts, skel, root_margin=-0.1)
+
+
+class TestKimodoCleanupReference:
+    @pytest.mark.parametrize("compile", [False, True])
+    @pytest.mark.parametrize(
+        "double_ankle, expected",
+        [
+            (
+                False,
+                [
+                    [-0.04, 0.1, 0.09],
+                    [-0.04, 0.02, 0.22638208],
+                    [0.16, 0.1, 0.09],
+                    [0.16, 0.02, 0.22638208],
+                ],
+            ),
+            (
+                True,
+                [
+                    [-0.49849010, 0.43295389, -0.30248523],
+                    [-0.59328073, 0.30865681, -0.27871582],
+                    [0.21368122, 0.23422104, 0.14068779],
+                    [0.17916445, 0.08811975, 0.19031662],
+                ],
+            ),
+        ],
+    )
+    def test_contact_cleanup_matches_original_cpp_oracle(
+        self, double_ankle, expected, compile
+    ):
+        from mlx_vlm.models.kimodo import post_process_motion
+
+        # Fixed source MotionCorrection outputs; no source extension is needed in CI.
+        skeleton, rotations, roots, contacts = TestKimodoPostprocess().motion()
+        if double_ankle:
+            skeleton.name = "g1skel34"
+        result = post_process_motion(
+            rotations, roots, contacts, skeleton, compile=compile
+        )
+        selected = result["posed_joints"][0, 5, mx.array([12, 13, 16, 17])]
+        np.testing.assert_allclose(np.array(selected), expected, atol=4e-5, rtol=1e-5)
+        np.testing.assert_array_equal(
+            np.array(result["root_positions"]), np.array(roots)
+        )
+
+
+class TestKimodoCleanupTransitions:
+    @pytest.mark.parametrize("compile", [False, True])
+    def test_each_segment_is_cleaned_with_its_transition_history(self, compile):
+        from mlx_vlm.models.kimodo import (
+            KimodoPipeline,
+            Model,
+            ModelConfig,
+            post_process_motion,
+        )
+        from mlx_vlm.models.kimodo.motion import KimodoMotionRep
+
+        fixture = TestKimodoPostprocess()
+        skeleton = fixture.skeleton()
+        rep = KimodoMotionRep(skeleton)
+        config = ModelConfig(
+            latent_dim=16,
+            ff_size=24,
+            num_layers=1,
+            num_heads=4,
+            llm_shape=(1, 16),
+            num_base_steps=16,
+            max_position_embeddings=64,
+            num_text_tokens_override=3,
+        )
+        encoder = lambda texts: (mx.zeros((len(texts), 1, 16)), [1] * len(texts))
+        pipeline = KimodoPipeline(Model(config, rep), encoder)
+
+        def sample(text_features, text_mask, lengths, steps, **kwargs):
+            _, local, roots, _ = fixture.motion(frames=max(lengths), batch=len(lengths))
+            return rep(local, roots, to_normalize=True, lengths=mx.array(lengths))
+
+        with (
+            patch.object(pipeline, "sample", side_effect=sample),
+            patch(
+                "mlx_vlm.models.kimodo.postprocess.post_process_motion",
+                wraps=post_process_motion,
+            ) as cleanup,
+        ):
+            with (
+                patch.object(
+                    mx, "eval", side_effect=AssertionError("eager evaluation")
+                ),
+                patch.object(
+                    mx, "synchronize", side_effect=AssertionError("synchronize")
+                ),
+            ):
+                result = pipeline.generate(
+                    ["walk", "wave"],
+                    [12, 12],
+                    4,
+                    multi_prompt=True,
+                    post_processing=True,
+                    compile=compile,
+                )
+        assert cleanup.call_count == 2
+        assert all(call.kwargs["compile"] == compile for call in cleanup.call_args_list)
+        assert [call.args[0].shape[1] for call in cleanup.call_args_list] == [12, 17]
+        history_constraints = cleanup.call_args_list[1].args[4][0]
+        assert history_constraints[0]["type"] == "fullbody"
+        assert history_constraints[0]["frame_indices"] == list(range(5))
+        assert history_constraints[1]["type"] == "end-effector"
+        assert result["posed_joints"].shape == (24, skeleton.nbjoints, 3)
+        assert mx.all(mx.isfinite(result["posed_joints"]))

@@ -36,6 +36,7 @@ Some models have detailed documentation with prompt formats, examples, and best 
 
 | Model | Documentation |
 |-------|---------------|
+| Kimodo (text-to-motion) | [Docs](mlx_vlm/models/kimodo/README.md) |
 | DeepSeek-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr/README.md) |
 | DeepSeek-OCR-2 | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/deepseekocr_2/README.md) |
 | Unlimited-OCR | [Docs](https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/models/unlimited_ocr/README.md) |
